@@ -1,0 +1,111 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: write
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Test
+        run: cargo test --all-features
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install aarch64 cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eux
+          APP_NAME="pstrings"
+          DIR="${APP_NAME}-${VERSION}-${TARGET}"
+          mkdir "$DIR"
+          if [[ "$TARGET" == *"windows"* ]]; then
+            cp "target/${TARGET}/release/${APP_NAME}.exe" "$DIR/"
+            7z a "${DIR}.zip" "$DIR"
+          else
+            cp "target/${TARGET}/release/${APP_NAME}" "$DIR/"
+            tar -czf "${DIR}.tar.gz" "$DIR"
+          fi
+      - name: Generate SHA-256
+        shell: bash
+        run: |
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            sha256sum *.zip > SHA256SUMS-${{ matrix.target }}.txt
+          else
+            sha256sum *.tar.gz > SHA256SUMS-${{ matrix.target }}.txt
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            *.zip
+            *.tar.gz
+            SHA256SUMS-*.txt
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create or update release
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" artifacts/* --clobber
+          else
+            gh release create "${{ github.ref_name }}" artifacts/* --generate-notes
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
