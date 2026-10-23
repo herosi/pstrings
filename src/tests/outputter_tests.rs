@@ -2,7 +2,6 @@ use super::support::*;
 use crate::encoding::InputEncoding;
 use crate::outputter::{output_merged_chunk, write_output_record};
 use crate::record::{write_record, MatchRecord, RecordData};
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek};
 use std::path::Path;
@@ -516,7 +515,7 @@ fn output_merged_chunk_stops_when_cancelled() {
     input.seek(std::io::SeekFrom::Start(0)).unwrap();
 
     let mut output = Vec::new();
-    let mut pending = HashMap::new();
+    let mut pending = crate::outputter::OutputState::default();
     // Cancelled from the very start (before any record is processed), so
     // this also confirms the cancellation check happens before doing any
     // work, not just partway through a large input.

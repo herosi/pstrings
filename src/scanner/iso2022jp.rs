@@ -252,7 +252,7 @@ pub(crate) fn is_iso2022jp_byte(b: u8) -> bool {
 /// false-positive problem for `--filter` to solve. See the "Which scanners
 /// this actually affects" section on `filter::CharacterFilter`.
 #[inline]
-fn char_allowed(ch: char) -> bool {
+pub(crate) fn char_allowed(ch: char) -> bool {
     if (ch as u32) <= 0x7f {
         filter::is_ascii_char(ch)
     } else {

@@ -197,7 +197,7 @@ pub(crate) enum Step {
 /// "stop here and carry every remaining byte over to the next block",
 /// with no assumption about how many bytes that is, so a two- or
 /// three-byte carry works exactly like a one-byte one.
-fn decode_step<E: Dbcs>(bytes: &[u8]) -> Step {
+pub(crate) fn decode_step<E: Dbcs>(bytes: &[u8]) -> Step {
     let Some(&b0) = bytes.first() else {
         return Step::Incomplete;
     };

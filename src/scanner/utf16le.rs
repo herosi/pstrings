@@ -19,44 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// `FilterSet::allows_u16`), plus astral-plane characters via surrogate pairs
 /// (see `decode_char_at`, checked via `FilterSet::allows_char`).
 ///
-/// Code units can start at either byte parity within a chunk, so, like
-/// `scanner::utf16le_ascii`, this scans both parities (see `scan_parity`)
-/// and combines the results. Unlike `utf16le_ascii`, the two parity results
-/// are *not* simply merged as-is: with a wide enough filter selection, real
-/// text read at the wrong parity can reinterpret as a same-length run of
-/// *other* allowed characters (see the KNOWN LIMITATION note below), so
-/// before merging, `resolve_parity_overlap` discards whichever side of each
-/// byte-range conflict looks less likely to be genuine.
-///
-/// KNOWN LIMITATION -- dual-parity false positives: genuine ASCII/Latin
-/// text read at the *wrong* parity reinterprets each pair of source bytes
-/// as one u16 of the form `(next_ascii_byte << 8) | ascii_byte`, and for
-/// printable ASCII (0x20-0x7E) that puts the result somewhere in
-/// U+2020-U+7E7E -- a span whose upper half sits inside CJK Unified
-/// Ideographs (U+4E00-U+9FFF) and whose middle sits inside Extension A
-/// (U+3400-U+4DBF), both of which `CharacterFilter::Kanji` admits.
-/// Measured empirically: misaligned real text produces a
-/// "noise" run of almost the same length as the genuine one (an
-/// 11-character ASCII string produced a spurious ~10-character run at the
-/// other parity when `Kanji` was selected), so neither narrowing individual
-/// filters nor a minimum-run-length threshold reliably filters it out --
-/// both were tried and rejected. `resolve_parity_overlap` (this scanner's
-/// actual mitigation for this specific failure mode) helps a lot here,
-/// but two independent measurements are also worth keeping in mind when
-/// choosing which filters to enable together:
-///   - Scanning raw/random binary data (e.g. disk free space) with the
-///     full BMP admitted, 1 MiB of pure random bytes produced matches
-///     covering ~73% of all code units. Restricting to a narrow filter set
-///     (e.g. `Ascii` + `Latin1` only) reduced that to effectively zero on
-///     the same data, since the odds of several consecutive random code
-///     units all landing in a narrow allowed range are very low. The
-///     broader a filter combination is, the more it trades detection
-///     recall for this kind of false-positive risk -- there's no filter
-///     selection that eliminates this tradeoff, only ways to tune where
-///     you sit on it.
-///   - Because of this, "throw every filter at it" is actively
-///     counterproductive: prefer the narrowest combination that covers
-///     what you're actually looking for.
+/// Both byte parities are emitted as candidates. The outputter rejoins each
+/// parity across chunk boundaries before resolving overlaps; comparing short
+/// fragments here can discard genuine text at the end of a chunk.
+/// Overlap selection still prefers ASCII-only runs, then the larger byte span.
+/// Broad Unicode filters can therefore still admit binary noise: choose the
+/// narrowest filter combination that covers the expected text.
 pub(crate) fn scan(
     file: &File,
     file_len: u64,
@@ -65,10 +33,8 @@ pub(crate) fn scan(
     temp_path: &Path,
     cancelled: &AtomicBool,
 ) -> io::Result<(u64, File)> {
-    let mut records0 = scan_parity(file, file_len, chunk, cfg, 0, cancelled)?;
-    let mut records1 = scan_parity(file, file_len, chunk, cfg, 1, cancelled)?;
-
-    resolve_parity_overlap(&mut records0, &mut records1);
+    let records0 = scan_parity(file, file_len, chunk, cfg, 0, cancelled)?;
+    let records1 = scan_parity(file, file_len, chunk, cfg, 1, cancelled)?;
 
     // Counted from the records that actually survive to be written, which
     // is the same policy `emit_record` enforces for every other scanner:
@@ -79,9 +45,7 @@ pub(crate) fn scan(
     let out_file = create_temp_file(temp_path, cfg.keep_temp())?;
     let mut out = BufWriter::with_capacity(crate::WRITE_BUFFER_SIZE, out_file);
 
-    // `records0`/`records1` are each individually offset-sorted (a single
-    // left-to-right scan per parity) and, after `resolve_parity_overlap`,
-    // no longer overlap each other -- so a plain two-way merge by offset
+    // Each parity is individually sorted. A plain two-way merge by offset
     // is enough to produce the fully sorted result `scan`'s caller expects.
     // (`merger::merge_sorted_record_files` isn't used here: it merges an
     // arbitrary, File-backed number of streams, which is unnecessary
@@ -200,12 +164,29 @@ fn scan_parity(
     // matches the requested `parity`. Derived arithmetically (rather than
     // with a branch) as: if chunk.offset already has the right parity, stay
     // put; otherwise step forward one byte.
-    let first = chunk.offset + ((parity + 2 - chunk.offset % 2) % 2);
+    let mut first = chunk.offset + ((parity + 2 - chunk.offset % 2) % 2);
 
     // No room for even one 2-byte code unit of this parity within the
     // chunk/file bounds -> nothing to scan.
     if first >= chunk_end || first + 1 >= file_len {
         return Ok(out);
+    }
+
+    // The preceding chunk may have consumed this low surrogate while
+    // completing a character. Start after it, so the next character is
+    // correctly marked as a boundary continuation, even for a short run.
+    if first >= 2 {
+        let mut pair = [0; 4];
+        read_exact_at(file, &mut pair, first - 2)?;
+        let high = u16::from_le_bytes([pair[0], pair[1]]);
+        if (0xD800..=0xDBFF).contains(&high)
+            && decode_char_at(cfg.filter(), &pair, 0).is_some_and(|(_, size)| size == 4)
+        {
+            first += 2;
+            if first >= chunk_end || first + 1 >= file_len {
+                return Ok(out);
+            }
+        }
     }
     // Last byte offset at which a code unit could validly *start*.
     // - If this chunk is *not* the last one in the file (chunk_end <
@@ -414,129 +395,12 @@ fn read_scan_block(
     Ok(filled)
 }
 
-/// Whether every character in `data` is admitted by `CharacterFilter::
-/// Ascii` alone. Used by `resolve_parity_overlap` to recognize the
-/// specific dual-parity false-positive pattern described in `scan`'s doc
-/// comment: a genuine ASCII run at one parity versus its same-byte-range
-/// misreading at the other (typically landing in `Kanji`'s range, when
-/// that filter is selected).
-///
-/// Deliberately checks against `Ascii` specifically, not "whatever filters
-/// are currently selected": the ASCII-vs-misread pattern is a fixed,
-/// well-understood signal regardless of which other filters happen to be
-/// active, so tying this to the selected filter set would make the
-/// heuristic's behavior depend on unrelated `--filter` choices.
-fn is_ascii_printable_only(data: &str) -> bool {
-    data.chars()
-        .all(|ch| filter::allows_char(&[filter::CharacterFilter::Ascii], ch))
-}
-
-/// Given two same-length-ish overlapping candidates -- one of which is
-/// often the dual-parity false-positive misreading of the other (see
-/// `scan`'s KNOWN LIMITATION note) -- decides which is more likely
-/// genuine.
-///
-/// The dominant real-world case (misaligned ASCII text) always produces
-/// the *genuine* run in the printable-ASCII range and the *spurious* one
-/// outside it, so "prefer whichever side is ASCII-only" directly targets
-/// that. When both sides are ASCII-only or both are non-ASCII -- e.g. two
-/// independent short matches that happen to overlap by coincidence, or a
-/// conflict this heuristic's targeted failure mode doesn't explain --
-/// there's no strong signal either way, so this just keeps the longer one
-/// (ties favor `a`, i.e. parity 0), rather than guessing further.
-///
-/// "Longer" means *bytes covered* (`cb`), not characters (`cch`). Those
-/// two agree for BMP-only runs, where every character is two bytes, but
-/// diverge as soon as surrogate pairs are involved: a run of astral
-/// characters spends four bytes per character, so counting characters
-/// would score it at half the weight of the wrong-parity misreading laid
-/// over the same bytes -- which decodes those same bytes as twice as many
-/// BMP code units. Since the whole point here is to pick between two
-/// readings of *one byte range*, the byte range is the fair comparison.
-fn prefer_a_over_b(a: &MatchRecord, b: &MatchRecord) -> bool {
-    match (is_ascii_printable_only(a.data.text_of()), is_ascii_printable_only(b.data.text_of())) {
+/// Compare complete runs, after boundary reassembly. Length is measured in
+/// source bytes so surrogate pairs are not penalized against BMP candidates.
+pub(crate) fn prefer_candidate(a_ascii: bool, a_cb: u64, b_ascii: bool, b_cb: u64) -> bool {
+    match (a_ascii, b_ascii) {
         (true, false) => true,
         (false, true) => false,
-        _ => a.cb >= b.cb,
+        _ => a_cb >= b_cb,
     }
-}
-
-/// Drops one side of every byte-range conflict between the two parity scan
-/// results, using `prefer_a_over_b` to decide which side survives.
-///
-/// Both inputs are individually offset-sorted (each is one left-to-right
-/// scan), so a standard two-pointer interval sweep finds every overlapping
-/// pair in O(records0.len() + records1.len()) without needing to compare
-/// every record against every other record.
-///
-/// Scoped to conflicts *within one chunk*: each side's records reflect
-/// only what this chunk's scan produced, before `outputter` joins any
-/// `ends_at_chunk`/`starts_at_chunk` fragment with its continuation in a
-/// neighboring chunk. A conflict that only becomes visible after such a
-/// join (e.g. the genuine run is short in this chunk but a long
-/// continuation elsewhere would have tipped `prefer_a_over_b`'s tie-break)
-/// isn't caught here. Resolving that fully would mean tracking parity
-/// through `outputter`'s cross-chunk pending/boundary-joining machinery
-/// (currently keyed only by `InputEncoding`, with no notion of parity) --
-/// left as future work if within-chunk resolution alone isn't enough in
-/// practice.
-fn resolve_parity_overlap(records0: &mut Vec<MatchRecord>, records1: &mut Vec<MatchRecord>) {
-    let mut drop0 = vec![false; records0.len()];
-    let mut drop1 = vec![false; records1.len()];
-    let mut i = 0usize;
-    let mut j = 0usize;
-
-    while i < records0.len() && j < records1.len() {
-        let a = &records0[i];
-        let b = &records1[j];
-        let a_end = a.offset + a.cb;
-        let b_end = b.offset + b.cb;
-
-        if a_end <= b.offset {
-            i += 1;
-            continue;
-        }
-        if b_end <= a.offset {
-            j += 1;
-            continue;
-        }
-
-        // Byte ranges overlap: exactly the situation this function exists
-        // to resolve. Two independent, unrelated matches essentially never
-        // occupy the same bytes by coincidence (there's only one way to
-        // align real UTF-16LE text over a given byte range), so this is a
-        // strong signal one side is the wrong-parity misreading of the
-        // other.
-        if prefer_a_over_b(a, b) {
-            drop1[j] = true;
-        } else {
-            drop0[i] = true;
-        }
-
-        // Advance whichever record(s) are now fully behind the other's
-        // range -- standard interval-sweep bookkeeping so a long record on
-        // one side can still be checked against several shorter records on
-        // the other.
-        if a_end < b_end {
-            i += 1;
-        } else if b_end < a_end {
-            j += 1;
-        } else {
-            i += 1;
-            j += 1;
-        }
-    }
-
-    let mut idx = 0;
-    records0.retain(|_| {
-        let keep = !drop0[idx];
-        idx += 1;
-        keep
-    });
-    idx = 0;
-    records1.retain(|_| {
-        let keep = !drop1[idx];
-        idx += 1;
-        keep
-    });
 }
