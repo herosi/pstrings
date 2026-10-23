@@ -5,6 +5,8 @@ mod filter;
 mod merger;
 mod outputter;
 mod record;
+mod payload;
+mod record_queue;
 mod scanner;
 mod stats;
 mod tempfile_helper;

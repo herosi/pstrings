@@ -251,7 +251,7 @@ fn run_output_stage(
 ) -> Option<io::Error> {
     let mut pending_files = BTreeMap::<u64, File>::new();
     let mut next_output_chunk = 0u64;
-    let mut pending_output = OutputState::default();
+    let mut pending_output = OutputState::new(cfg.temp_dir().clone());
     let output_started = Instant::now();
     let mut output_processing = Duration::ZERO;
     let mut output_error: Option<io::Error> = None;

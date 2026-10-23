@@ -42,7 +42,7 @@ use std::sync::atomic::AtomicBool;
 fn text_of(rec: &crate::record::MatchRecord) -> &str {
     match &rec.data {
         RecordData::Text(s) => s,
-        RecordData::Raw(_) => panic!("test observed an unresolved Raw record: {rec:?}"),
+        RecordData::Raw(_) | RecordData::Spilled(_) => panic!("test observed an unresolved Raw record: {rec:?}"),
     }
 }
 

@@ -32,6 +32,7 @@ pub(crate) const RECORD_MAGIC: u32 = 0x31545350; // "PST1"
 pub(crate) enum RecordData {
     /// Already-decoded text, ready to write out directly.
     Text(String),
+    Spilled(crate::payload::Spilled),
     /// Raw bytes in the record's original encoding, not yet decoded or
     /// even split into individual characters. Only ever produced for
     /// chunk-boundary-touching fragments of a non-self-synchronizing
@@ -58,6 +59,7 @@ impl RecordData {
     pub(crate) fn text_of(&self) -> &str {
         match &self {
             RecordData::Text(s) => s,
+            RecordData::Spilled(_) => unreachable!("spilled payload has no borrowed text"),
             RecordData::Raw(_) => unreachable!(
                 "text_of() called on a Raw record -- only self-synchronizing encodings should call this, \
                  and they never produce Raw records (see InputEncoding::is_self_synchronizing)"
@@ -138,26 +140,11 @@ pub(crate) enum RecordDataRef<'a> {
 /// `InputEncoding::is_self_synchronizing` -- so two records of the same
 /// encoding that both made it into `pending`/`boundary` can never disagree
 /// on variant.
-pub(crate) fn append_data(dst: &mut MatchRecord, src: MatchRecord) {
+pub(crate) fn append_data(dst: &mut MatchRecord, src: MatchRecord, dir: Option<&std::path::Path>) -> io::Result<()> {
     dst.cb += src.cb;
     dst.ends_at_chunk = src.ends_at_chunk;
-    match (&mut dst.data, src.data) {
-        (RecordData::Text(dst_s), RecordData::Text(src_s)) => {
-            dst.cch += src.cch;
-            dst_s.push_str(&src_s);
-        }
-        (RecordData::Raw(dst_b), RecordData::Raw(src_b)) => {
-            // `cch` stays a placeholder here -- real character counting
-            // happens once `outputter` decodes+segments the combined raw
-            // bytes via `scanner::segment_raw`.
-            dst_b.extend_from_slice(&src_b);
-        }
-        _ => unreachable!(
-            "append_data: mismatched RecordData variants for encoding {:?} -- every encoding \
-             consistently produces either Text or Raw boundary records, never a mix",
-            dst.encoding
-        ),
-    }
+    if !dst.data.is_raw() { dst.cch += src.cch; }
+    dst.data.append(src.data, dir)
 }
 
 /// Serializes one `MatchRecord` into the binary intermediate-record format.
@@ -172,7 +159,7 @@ pub(crate) fn write_record(w: &mut impl Write, rec: &MatchRecord) -> io::Result<
     // the converse direction is an invariant worth asserting: a `Raw`
     // record must never come from a self-synchronizing encoding.
     debug_assert!(
-        !matches!(rec.data, RecordData::Raw(_)) || !rec.encoding.is_self_synchronizing(),
+        !rec.data.is_raw() || !rec.encoding.is_self_synchronizing(),
         "encoding {:?} produced a RecordData::Raw record, but is_self_synchronizing() says it \
          should always be able to decode at scan time",
         rec.encoding,
@@ -206,8 +193,8 @@ pub(crate) fn write_record(w: &mut impl Write, rec: &MatchRecord) -> io::Result<
     header[20..28].copy_from_slice(&rec.cch.to_le_bytes());
     header[28..30].copy_from_slice(&(rec.encoding as u16).to_le_bytes());
 
-    // Pack the three boolean/discriminant bits into one flags value:
-    // bit 0 = starts_at_chunk, bit 1 = ends_at_chunk, bit 2 = is_raw
+    // Pack the boundary, payload and ASCII metadata bits into one flags value:
+    // bit 0 = starts_at_chunk, bit 1 = ends_at_chunk, bit 2 = is_raw, bit 3 = ASCII text
     // (payload is RecordData::Raw rather than RecordData::Text).
     let mut flags = 0u16;
     if rec.starts_at_chunk {
@@ -216,18 +203,13 @@ pub(crate) fn write_record(w: &mut impl Write, rec: &MatchRecord) -> io::Result<
     if rec.ends_at_chunk {
         flags |= 2;
     }
-    let data: &[u8] = match &rec.data {
-        RecordData::Text(s) => s.as_bytes(),
-        RecordData::Raw(b) => {
-            flags |= 4;
-            b.as_slice()
-        }
-    };
+    if rec.data.is_raw() { flags |= 4; }
+    if rec.data.is_ascii() { flags |= 8; }
     header[30..32].copy_from_slice(&flags.to_le_bytes());
-    header[32..40].copy_from_slice(&(data.len() as u64).to_le_bytes());
+    header[32..40].copy_from_slice(&rec.data.payload_len().to_le_bytes());
 
     w.write_all(&header)?;
-    w.write_all(data)?;
+    rec.data.write_payload(w)?;
     Ok(())
 }
 

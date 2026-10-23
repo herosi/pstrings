@@ -5,9 +5,11 @@
 use crate::READ_BUFFER_SIZE;
 use crate::encoding::InputEncoding;
 use crate::record::{MatchRecord, RecordData, RecordDataRef, append_data, read_record_borrowed};
-use std::collections::{BTreeMap, HashMap};
+use crate::record_queue::RecordQueue;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -71,21 +73,59 @@ fn note_emitted(encoding: InputEncoding) {
 #[derive(Default)]
 pub struct OutputState {
     pending: HashMap<InputEncoding, MatchRecord>,
-    ready: BTreeMap<(u64, u16, u64), MatchRecord>,
-    sequence: u64,
+    ready: HashMap<InputEncoding, RecordQueue>,
+    temp_dir: Option<PathBuf>,
 }
 
 impl OutputState {
-    fn complete(&mut self, rec: MatchRecord, min_cch: u64) {
-        let (records, leftover) = resolve_for_output(rec, min_cch);
-        for record in records {
-            let key = (record.offset, record.encoding as u16, self.sequence);
-            self.sequence += 1;
-            self.ready.insert(key, record);
+    pub fn new(temp_dir: Option<PathBuf>) -> Self {
+        Self {
+            temp_dir,
+            ..Self::default()
         }
+    }
+
+    fn enqueue(&mut self, record: MatchRecord) -> io::Result<()> {
+        if !self.ready.contains_key(&record.encoding) {
+            self.ready
+                .insert(record.encoding, RecordQueue::new(self.temp_dir.as_deref())?);
+        }
+        self.ready.get_mut(&record.encoding).unwrap().push(&record)
+    }
+
+    fn complete(&mut self, rec: MatchRecord, min_cch: u64) -> io::Result<()> {
+        let leftover = if matches!(&rec.data, RecordData::Spilled(data) if data.raw) {
+            let dir = self.temp_dir.clone();
+            crate::payload::decode_spilled(rec, dir.as_deref(), |record| {
+                if record.cch >= min_cch {
+                    self.enqueue(record)?;
+                }
+                Ok(())
+            })?
+        } else if matches!(&rec.data, RecordData::Spilled(_)) {
+            if rec.cch >= min_cch {
+                self.enqueue(rec)?;
+            }
+            None
+        } else {
+            let (records, leftover) = resolve_for_output(rec, min_cch);
+            for record in records {
+                self.enqueue(record)?;
+            }
+            leftover
+        };
         if let Some(record) = leftover {
             self.pending.insert(record.encoding, record);
         }
+        Ok(())
+    }
+
+    fn ready_key(&self) -> Option<(u64, u16)> {
+        self.ready
+            .values()
+            .filter_map(|queue| queue.front)
+            .map(|head| (head.offset, head.encoding as u16))
+            .min()
     }
 
     fn emit_before(
@@ -95,13 +135,13 @@ impl OutputState {
         str_only: bool,
     ) -> io::Result<()> {
         let mut scratch = Vec::new();
-        while self
-            .ready
-            .first_key_value()
-            .is_some_and(|(key, _)| (key.0, key.1) < bound)
-        {
-            let (_, record) = self.ready.pop_first().unwrap();
+        while let Some(key) = self.ready_key().filter(|key| *key < bound) {
+            let encoding = InputEncoding::try_from(key.1)?;
+            let queue = self.ready.get_mut(&encoding).unwrap();
+            let record = queue.pop()?;
             write_output_record(out, &record, str_only, &mut scratch)?;
+            drop(record);
+            queue.reset_if_empty()?;
         }
         Ok(())
     }
@@ -157,11 +197,7 @@ pub fn output_merged_chunk(
         if !raw.ends_at_chunk && !previous.contains_key(&raw.encoding) && input_bound < earlier {
             if let RecordDataRef::Text(text) = raw.data {
                 state.emit_before(input_bound, out, str_only)?;
-                if state
-                    .ready
-                    .first_key_value()
-                    .is_none_or(|(key, _)| (key.0, key.1) >= input_bound)
-                {
+                if state.ready_key().is_none_or(|key| key >= input_bound) {
                     if raw.cch >= min_cch {
                         write_output_record_str(
                             out,
@@ -180,16 +216,17 @@ pub fn output_merged_chunk(
         if let Some(prev) = previous.remove(&rec.encoding) {
             if rec.starts_at_chunk && prev.offset + prev.cb == rec.offset {
                 let mut merged = prev;
-                append_data(&mut merged, rec);
+                append_data(&mut merged, rec, state.temp_dir.as_deref())?;
                 rec = merged;
             } else {
-                state.complete(prev, min_cch);
+                state.complete(prev, min_cch)?;
             }
         }
         if rec.ends_at_chunk {
+            rec.data.spill(state.temp_dir.as_deref())?;
             state.pending.insert(rec.encoding, rec);
         } else {
-            state.complete(rec, min_cch);
+            state.complete(rec, min_cch)?;
         }
         let previous_bound = previous
             .values()
@@ -207,7 +244,7 @@ pub fn output_merged_chunk(
         if chunk_len > 0 && prev.offset.saturating_add(prev.cb) >= chunk_end {
             state.pending.insert(encoding, prev);
         } else {
-            state.complete(prev, min_cch);
+            state.complete(prev, min_cch)?;
         }
     }
     state.emit_before(state.lower_bound().min((chunk_end, 0)), out, str_only)
@@ -221,13 +258,9 @@ pub fn flush_pending(
     str_only: bool,
 ) -> io::Result<()> {
     for (_, rec) in std::mem::take(&mut state.pending) {
-        let (records, _) = resolve_for_output(rec, min_cch);
-        for record in records {
-            let key = (record.offset, record.encoding as u16, state.sequence);
-            state.sequence += 1;
-            state.ready.insert(key, record);
-        }
+        state.complete(rec, min_cch)?;
     }
+    state.pending.clear(); // incomplete final code units have no continuation
     state.emit_before((u64::MAX, u16::MAX), out, str_only)
 }
 
@@ -263,6 +296,7 @@ fn resolve_for_output(rec: MatchRecord, min_cch: u64) -> (Vec<MatchRecord>, Opti
     } = rec;
 
     match data {
+        RecordData::Spilled(_) => unreachable!("spilled records resolve through OutputState"),
         RecordData::Text(s) => {
             let keep = cch >= min_cch;
             let written = if keep {
@@ -333,6 +367,24 @@ pub fn write_output_record(
     scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let text = match &rec.data {
+        RecordData::Spilled(data) if !data.raw => {
+            scratch.clear();
+            if !str_only {
+                let mut number = itoa::Buffer::new();
+                let number = number.format(rec.offset);
+                scratch.resize(20usize.saturating_sub(number.len()), b'0');
+                scratch.extend_from_slice(number.as_bytes());
+                scratch.push(b'\t');
+                scratch.extend_from_slice(rec.encoding.name().as_bytes());
+                scratch.push(b'\t');
+            }
+            out.write_all(scratch)?;
+            data.copy_to(out)?;
+            out.write_all(LINE_ENDING.as_bytes())?;
+            note_emitted(rec.encoding);
+            return Ok(());
+        }
+        RecordData::Spilled(_) => unreachable!("unresolved raw spilled record"),
         RecordData::Text(s) => s.as_str(),
         RecordData::Raw(_) => {
             debug_assert!(
