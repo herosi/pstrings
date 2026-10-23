@@ -20,7 +20,7 @@ pub use filter::{CharacterFilter, DEFAULT_FILTERS};
 pub use merger::merge_chunk_encodings;
 pub use outputter::{
     begin_emitted_counts, flush_pending, output_merged_chunk, take_emitted_counts,
-    write_output_record,
+    write_output_record, OutputState,
 };
 pub use record::MatchRecord;
 pub use scanner::scan;
