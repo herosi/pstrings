@@ -3,7 +3,7 @@ use std::{
     cmp::min,
     collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
-    fs::File,
+    fs::{File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
@@ -93,9 +93,23 @@ fn install_cancel_handler() -> Result<Arc<AtomicBool>, Box<dyn std::error::Error
     Ok(cancelled)
 }
 
-fn make_output_writer(output_path: &Option<PathBuf>) -> io::Result<Box<dyn Write>> {
+fn make_output_writer(input: &File, output_path: &Option<PathBuf>) -> io::Result<Box<dyn Write>> {
     Ok(match output_path {
-        Some(path) => Box::new(BufWriter::with_capacity(WRITE_BUFFER_SIZE, File::create(path)?)),
+        Some(path) => {
+            // Open without truncation and compare the actual handles, so aliases
+            // and links cannot destroy the input before the check completes.
+            let output = OpenOptions::new().write(true).create(true).truncate(false).open(path)?;
+            if output.metadata()?.is_file() {
+                if same_file::Handle::from_file(input.try_clone()?)?
+                    == same_file::Handle::from_file(output.try_clone()?)?
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "input and output refer to the same file"));
+                }
+                output.set_len(0)?;
+            }
+            Box::new(BufWriter::with_capacity(WRITE_BUFFER_SIZE, output))
+        }
         None => Box::new(BufWriter::with_capacity(WRITE_BUFFER_SIZE, io::stdout())),
     })
 }
@@ -471,6 +485,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = temp_guard.path().to_path_buf();
 
     let file = Arc::new(File::open(args.input())?);
+    let mut output = make_output_writer(&file, args.output())?;
     let chunk_count = (file_len + cfg.chunk_size() - 1) / cfg.chunk_size();
 
     let (handles, rx) = spawn_workers(
@@ -483,7 +498,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&detailed_stats),
     );
 
-    let mut output = make_output_writer(args.output())?;
     // Only tally output records when they'll actually be shown. When they
     // won't, the counters in `outputter`'s write path short-circuit on an
     // already-`None` check.
