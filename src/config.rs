@@ -98,7 +98,7 @@ pub struct Args {
 
     /// Chunk size, the unit of parallel work. Accepts K/M/G/T suffixes
     /// (binary, so 1K is 1024), or "auto" to derive one from the input
-    /// size and thread count. Clamped to the file size. Must be even when
+    /// size and thread count. The last chunk may be shorter. Must be even when
     /// -e utf16le is selected, so a chunk boundary cannot fall inside a
     /// code unit.
     #[arg(
