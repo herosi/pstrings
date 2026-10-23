@@ -46,7 +46,7 @@ fn build_config(args: &Args, file_len: u64) -> Result<Config, Box<dyn std::error
     let chunk_size = if args.chunk_size().eq_ignore_ascii_case("auto") {
         auto_chunk_size(file_len, jobs)
     } else {
-        let size = parse_size(&args.chunk_size())?.min(file_len);
+        let size = parse_size(&args.chunk_size())?;
 
         if size == 0 {
             return Err("--chunk-size must be > 0".into());
@@ -471,7 +471,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = temp_guard.path().to_path_buf();
 
     let file = Arc::new(File::open(args.input())?);
-    let chunk_count = (file_len + cfg.chunk_size() - 1) / cfg.chunk_size();
+    let chunk_count = file_len.div_ceil(cfg.chunk_size());
 
     let (handles, rx) = spawn_workers(
         Arc::clone(&file),
