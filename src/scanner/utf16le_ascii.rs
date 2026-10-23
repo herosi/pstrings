@@ -49,12 +49,11 @@ pub(crate) fn scan(
 ///
 /// Note: this is meant for UTF-16LE characters in the Latin-1 range,
 /// i.e. code units of the form 0x00XX, which the `u as u8` truncation
-/// below reduces to a single byte. That truncation is only sound for the
-/// filters this scanner is intended to be used with (`ascii`, `latin1`);
-/// a wider selection such as `--filter kanji` will admit code units above
-/// 0xFF and silently truncate them to garbage. Use `scanner::utf16le` for
-/// anything beyond Latin-1 -- full UTF-16LE, including surrogate pairs,
-/// is out of scope here.
+/// below reduces to a single byte. Reject wider code units before checking
+/// the byte-oriented filter, even when the shared filter set also admits
+/// CJK or other Unicode characters for `scanner::utf16le`. Otherwise their
+/// low bytes would be emitted as unrelated characters, including newlines.
+/// Full UTF-16LE, including surrogate pairs, is out of scope here.
 fn scan_parity(
     file: &File,
     file_len: u64,
@@ -160,7 +159,7 @@ fn scan_parity(
             let abs = block_start + i as u64;
             let u = u16::from_le_bytes([buf[i], buf[i + 1]]);
 
-            if cfg.filter().allows_u16(u) {
+            if u <= u8::MAX as u16 && cfg.filter().allows_u8(u as u8) {
                 if run_data.is_empty() {
                     run_offset = abs;
                     // Only true if this run's first unit is the very first
