@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Condvar, Mutex,
         mpsc::{sync_channel, RecvTimeoutError, Receiver, SyncSender},
     },
     thread,
@@ -144,6 +144,38 @@ fn process_chunk(
     Ok(merged_file)
 }
 
+// A permit survives scanning and queueing until the outputter consumes the
+// chunk. Channel capacity alone cannot bound its out-of-order file map.
+struct InFlight {
+    available: Mutex<usize>,
+    ready: Condvar,
+}
+
+struct ChunkPermit(Arc<InFlight>);
+
+impl InFlight {
+    fn acquire(self: &Arc<Self>, cancelled: &AtomicBool) -> Option<ChunkPermit> {
+        let mut available = self.available.lock().unwrap();
+        while *available == 0 && !cancelled.load(Ordering::Relaxed) {
+            available = self.ready.wait_timeout(available, Duration::from_millis(100)).unwrap().0;
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        *available -= 1;
+        Some(ChunkPermit(Arc::clone(self)))
+    }
+}
+
+impl Drop for ChunkPermit {
+    fn drop(&mut self) {
+        *self.0.available.lock().unwrap() += 1;
+        self.0.ready.notify_one();
+    }
+}
+
+type ChunkResult = (u64, File, ChunkPermit);
+
 /// Body of one worker thread: repeatedly claims the next chunk index,
 /// processes it, and sends the merged result to the outputter. Returns as
 /// soon as chunks run out, cancellation is observed, or the outputter has
@@ -157,7 +189,8 @@ fn worker_loop(
     temp_dir: PathBuf,
     cancelled: Arc<AtomicBool>,
     next_chunk: Arc<AtomicU64>,
-    tx: SyncSender<(u64, File)>,
+    tx: SyncSender<ChunkResult>,
+    in_flight: Arc<InFlight>,
     detailed_stats: Arc<DetailedStats>,
 ) -> io::Result<()> {
     loop {
@@ -165,6 +198,9 @@ fn worker_loop(
             break;
         }
 
+        let Some(permit) = in_flight.acquire(&cancelled) else {
+            break;
+        };
         let index = next_chunk.fetch_add(1, Ordering::Relaxed);
         if index >= chunk_count {
             break;
@@ -176,7 +212,7 @@ fn worker_loop(
             break;
         }
 
-        if tx.send((index, merged_file)).is_err() {
+        if tx.send((index, merged_file, permit)).is_err() {
             break;
         }
     }
@@ -195,9 +231,11 @@ fn spawn_workers(
     temp_dir: PathBuf,
     cancelled: Arc<AtomicBool>,
     detailed_stats: Arc<DetailedStats>,
-) -> (Vec<thread::JoinHandle<io::Result<()>>>, Receiver<(u64, File)>) {
+) -> (Vec<thread::JoinHandle<io::Result<()>>>, Receiver<ChunkResult>) {
     let next_chunk = Arc::new(AtomicU64::new(0));
-    let (tx, rx): (SyncSender<(u64, File)>, Receiver<(u64, File)>) = sync_channel(cfg.jobs() * 2);
+    let window = cfg.jobs().saturating_mul(2);
+    let in_flight = Arc::new(InFlight { available: Mutex::new(window), ready: Condvar::new() });
+    let (tx, rx): (SyncSender<ChunkResult>, Receiver<ChunkResult>) = sync_channel(window);
 
     let mut handles = Vec::with_capacity(cfg.jobs());
 
@@ -205,13 +243,14 @@ fn spawn_workers(
         let file = Arc::clone(&file);
         let cancelled = Arc::clone(&cancelled);
         let next_chunk = Arc::clone(&next_chunk);
+        let in_flight = Arc::clone(&in_flight);
         let tx = tx.clone();
         let cfg = cfg.clone();
         let temp_dir = temp_dir.clone();
         let detailed_stats = Arc::clone(&detailed_stats);
 
         handles.push(thread::spawn(move || -> io::Result<()> {
-            let result = worker_loop(
+            let result = std::panic::catch_unwind(|| worker_loop(
                 file,
                 file_len,
                 chunk_count,
@@ -220,8 +259,16 @@ fn spawn_workers(
                 Arc::clone(&cancelled),
                 next_chunk,
                 tx,
+                in_flight,
                 detailed_stats,
-            );
+            ));
+            let result = match result {
+                Ok(result) => result,
+                Err(panic) => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    std::panic::resume_unwind(panic);
+                }
+            };
 
             if result.is_err() {
                 cancelled.store(true, Ordering::SeqCst);
@@ -241,7 +288,7 @@ fn spawn_workers(
 /// (if any) rather than propagating it immediately, since the caller still
 /// needs to join the worker threads regardless.
 fn run_output_stage(
-    rx: Receiver<(u64, File)>,
+    rx: Receiver<ChunkResult>,
     chunk_count: u64,
     file_len: u64,
     cfg: &Config,
@@ -249,7 +296,7 @@ fn run_output_stage(
     cancelled: &AtomicBool,
     detailed_stats: &DetailedStats,
 ) -> Option<io::Error> {
-    let mut pending_files = BTreeMap::<u64, File>::new();
+    let mut pending_files = BTreeMap::<u64, (File, ChunkPermit)>::new();
     let mut next_output_chunk = 0u64;
     let mut pending_output: HashMap<InputEncoding, MatchRecord> = HashMap::new();
     let output_started = Instant::now();
@@ -263,8 +310,8 @@ fn run_output_stage(
 
         while !pending_files.contains_key(&next_output_chunk) {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((index, file)) => {
-                    pending_files.insert(index, file);
+                Ok((index, file, permit)) => {
+                    pending_files.insert(index, (file, permit));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if cancelled.load(Ordering::Relaxed) {
@@ -288,7 +335,7 @@ fn run_output_stage(
             break;
         }
 
-        let merged_file = pending_files.remove(&next_output_chunk).unwrap();
+        let (merged_file, _permit) = pending_files.remove(&next_output_chunk).unwrap();
         let output_processing_started = Instant::now();
 
         if let Err(e) = output_merged_chunk(
