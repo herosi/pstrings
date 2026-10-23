@@ -17,6 +17,7 @@ clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
 tempfile = "3.27"
 itoa = "1"
+same-file = "1.0"
 encoding_rs = "0.8.35"
 
 [target.'cfg(unix)'.dependencies]
