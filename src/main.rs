@@ -272,6 +272,11 @@ fn run_output_stage(
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    // Cancellation can close the last sender while recv_timeout
+                    // is blocked. That is normal shutdown, not a missing chunk.
+                    if cancelled.load(Ordering::SeqCst) {
+                        break;
+                    }
                     output_error = Some(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         format!(
@@ -529,5 +534,45 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config::new(vec![InputEncoding::Ascii], vec![CharacterFilter::Ascii],
+                    4, 1, 8, false, None, false)
+    }
+
+    #[test]
+    fn channel_shutdown_after_cancellation_is_not_a_worker_failure() {
+        for _ in 0..4 {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancelled);
+            let (tx, rx) = sync_channel(1);
+            let worker = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                flag.store(true, Ordering::SeqCst);
+                drop(tx);
+            });
+            let mut output: Box<dyn Write> = Box::new(io::sink());
+            let error = run_output_stage(rx, 1, 8, &config(), &mut output,
+                                         &cancelled, &DetailedStats::default());
+            worker.join().unwrap();
+            assert!(error.is_none(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn an_unexpected_channel_shutdown_is_still_an_error() {
+        let (tx, rx) = sync_channel(1);
+        drop(tx);
+        let cancelled = AtomicBool::new(false);
+        let mut output: Box<dyn Write> = Box::new(io::sink());
+        let error = run_output_stage(rx, 1, 8, &config(), &mut output,
+                                     &cancelled, &DetailedStats::default()).unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
