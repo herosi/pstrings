@@ -9,7 +9,7 @@
 - Runs fast using multiple threads
 - Supports multiple encodings (Experimental)
   - UTF-8, UTF-16LE, CP932 (Shift-JIS), ISO-2022-JP, Windows-1252 (Latin1), EUC-KR, GB18030, GBK, BIG5, Windows-1251
-- Memory-efficient even on huge files (about 24MB per worker thread)
+- Uses bounded output buffers and temporary files for long strings and delayed records
 
 
 ## Use Cases
@@ -268,3 +268,17 @@ cargo build --release
 ```
 
 I tested on Windows 11, Server 2025 and Ubuntu 24.04 on x64.
+
+## Temporary storage and memory
+
+Worker memory depends on the selected scanners and chunk size. The full UTF-16LE
+scanner retains candidates for a chunk, so memory use is not a fixed amount per
+worker. Strings crossing chunk boundaries spill to temporary files when their
+payload exceeds 8 MiB. Completed records waiting behind an earlier string are
+also queued on disk so output stays sorted by offset.
+
+Spilling preserves the complete strings; it does not impose a maximum string
+length. It trades memory for temporary disk space and I/O. A long run may need
+space for its source bytes, decoded text, and queued output while it is being
+resolved. Use `--temp-dir` to select a filesystem with enough free space. These
+spool files are removed when their records or output state are dropped.

@@ -21,7 +21,7 @@ use crate::filter::CharacterFilter;
 use crate::merger::merge_chunk_encodings;
 use crate::outputter::output_merged_chunk;
 use crate::record::{read_record, MatchRecord};
-use std::collections::HashMap;
+use crate::outputter::OutputState;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek};
 use std::path::{Path, PathBuf};
@@ -205,7 +205,7 @@ pub(crate) fn read_records(f: &mut File) -> Vec<MatchRecord> {
 /// the real merge step).
 pub(crate) fn merge_test_encoding_chunks(files: Vec<File>, min_cch: u64) -> String {
     let mut output = Vec::new();
-    let mut pending: HashMap<InputEncoding, MatchRecord> = HashMap::new();
+    let mut pending = OutputState::default();
     let cancel = AtomicBool::new(false);
     for (index, mut file) in files.into_iter().enumerate() {
         // `output_merged_chunk` needs to know where the *current* chunk
@@ -268,7 +268,7 @@ pub(crate) fn merge_test_encoding_chunks(files: Vec<File>, min_cch: u64) -> Stri
 /// inferred version would hide boundary bugs instead of catching them.
 pub(crate) fn merge_test_encoding_chunks_at(chunks: Vec<(u64, u64, File)>, min_cch: u64) -> String {
     let mut output = Vec::new();
-    let mut pending: HashMap<InputEncoding, MatchRecord> = HashMap::new();
+    let mut pending = OutputState::default();
     let cancel = AtomicBool::new(false);
     for (chunk_offset, chunk_len, file) in chunks {
         output_merged_chunk(file, chunk_offset, chunk_len, &mut pending, min_cch, &mut output, false, &cancel).unwrap();
@@ -296,7 +296,7 @@ pub(crate) fn merge_test_single_chunk(paths: &[PathBuf], min_cch: u64) -> String
     let merged_file = merge_chunk_encodings(inputs, &merged_path, &cancel, &cfg).unwrap();
 
     let mut output = Vec::new();
-    let mut pending: HashMap<InputEncoding, MatchRecord> = HashMap::new();
+    let mut pending = OutputState::default();
     output_merged_chunk(merged_file, 0, u64::MAX, &mut pending, min_cch, &mut output, false, &cancel).unwrap();
     crate::outputter::flush_pending(&mut pending, min_cch, &mut output, false).unwrap();
     String::from_utf8(output).unwrap()
@@ -342,7 +342,7 @@ pub(crate) fn merge_test_full(encoding_chunks: &[(InputEncoding, Vec<PathBuf>)],
     }
 
     let mut output = Vec::new();
-    let mut pending: HashMap<InputEncoding, MatchRecord> = HashMap::new();
+    let mut pending = OutputState::default();
     for (index, mut file) in merged_files.into_iter().enumerate() {
         // Same offset-inference trick as `merge_test_encoding_chunks`
         // (see the comment there): read the first record's offset if one
