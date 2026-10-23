@@ -72,7 +72,9 @@ fn note_emitted(encoding: InputEncoding) {
 /// retains complete records that must wait for an earlier string to close.
 #[derive(Default)]
 pub struct OutputState {
-    pending: HashMap<InputEncoding, MatchRecord>,
+    pending: HashMap<(InputEncoding, u8), MatchRecord>,
+    parity: [Option<RecordQueue>; 2],
+    discard_parity: [bool; 2],
     ready: HashMap<InputEncoding, RecordQueue>,
     temp_dir: Option<PathBuf>,
 }
@@ -86,6 +88,17 @@ impl OutputState {
     }
 
     fn enqueue(&mut self, record: MatchRecord) -> io::Result<()> {
+        if record.encoding == InputEncoding::Utf16le {
+            let parity = (record.offset % 2) as usize;
+            if self.parity[parity].is_none() {
+                self.parity[parity] = Some(RecordQueue::new(self.temp_dir.as_deref())?);
+            }
+            return self.parity[parity].as_mut().unwrap().push(&record);
+        }
+        self.enqueue_final(record)
+    }
+
+    fn enqueue_final(&mut self, record: MatchRecord) -> io::Result<()> {
         if !self.ready.contains_key(&record.encoding) {
             self.ready
                 .insert(record.encoding, RecordQueue::new(self.temp_dir.as_deref())?);
@@ -115,7 +128,65 @@ impl OutputState {
             leftover
         };
         if let Some(record) = leftover {
-            self.pending.insert(record.encoding, record);
+            self.pending
+                .insert(stream_key(record.encoding, record.offset), record);
+        }
+        Ok(())
+    }
+
+    fn parity_bound(&self) -> (u64, u16) {
+        self.parity
+            .iter()
+            .filter_map(|queue| queue.as_ref().and_then(|q| q.front))
+            .map(|head| (head.offset, head.encoding as u16))
+            .min()
+            .unwrap_or((u64::MAX, u16::MAX))
+    }
+
+    fn finish_parity(&mut self, parity: usize) -> io::Result<()> {
+        let record = self.parity[parity].as_mut().unwrap().pop()?;
+        if !std::mem::replace(&mut self.discard_parity[parity], false) {
+            self.enqueue_final(record)?;
+        } else {
+            drop(record);
+        }
+        self.parity[parity].as_mut().unwrap().reset_if_empty()
+    }
+
+    fn resolve_parities(&mut self, known_before: u64) -> io::Result<()> {
+        loop {
+            let heads = self
+                .parity
+                .each_ref()
+                .map(|queue| queue.as_ref().and_then(|q| q.front));
+            match heads {
+                [Some(a), Some(b)] => {
+                    let a_end = a.offset + a.cb;
+                    let b_end = b.offset + b.cb;
+                    if a_end <= b.offset {
+                        self.finish_parity(0)?;
+                    } else if b_end <= a.offset {
+                        self.finish_parity(1)?;
+                    } else {
+                        let prefer_a = crate::scanner::utf16le::prefer_candidate(
+                            a.flags & 8 != 0,
+                            a.cb,
+                            b.flags & 8 != 0,
+                            b.cb,
+                        );
+                        self.discard_parity[usize::from(prefer_a)] = true;
+                        if a_end <= b_end {
+                            self.finish_parity(0)?;
+                        }
+                        if b_end <= a_end {
+                            self.finish_parity(1)?;
+                        }
+                    }
+                }
+                [Some(a), None] if a.offset + a.cb <= known_before => self.finish_parity(0)?,
+                [None, Some(b)] if b.offset + b.cb <= known_before => self.finish_parity(1)?,
+                _ => break,
+            }
         }
         Ok(())
     }
@@ -134,6 +205,8 @@ impl OutputState {
         out: &mut impl Write,
         str_only: bool,
     ) -> io::Result<()> {
+        self.resolve_parities(bound.0)?;
+        let bound = bound.min(self.parity_bound());
         let mut scratch = Vec::new();
         while let Some(key) = self.ready_key().filter(|key| *key < bound) {
             let encoding = InputEncoding::try_from(key.1)?;
@@ -153,6 +226,17 @@ impl OutputState {
             .min()
             .unwrap_or((u64::MAX, u16::MAX))
     }
+}
+
+fn stream_key(encoding: InputEncoding, offset: u64) -> (InputEncoding, u8) {
+    (
+        encoding,
+        if encoding == InputEncoding::Utf16le {
+            (offset % 2) as u8
+        } else {
+            0
+        },
+    )
 }
 
 /// Consumes one offset-sorted chunk. Boundary continuation and empty chunks
@@ -193,8 +277,13 @@ pub fn output_merged_chunk(
             .map(|r| (r.offset, r.encoding as u16))
             .min()
             .unwrap_or((u64::MAX, u16::MAX))
-            .min(state.lower_bound());
-        if !raw.ends_at_chunk && !previous.contains_key(&raw.encoding) && input_bound < earlier {
+            .min(state.lower_bound())
+            .min(state.parity_bound());
+        if raw.encoding != InputEncoding::Utf16le
+            && !raw.ends_at_chunk
+            && !previous.contains_key(&stream_key(raw.encoding, raw.offset))
+            && input_bound < earlier
+        {
             if let RecordDataRef::Text(text) = raw.data {
                 state.emit_before(input_bound, out, str_only)?;
                 if state.ready_key().is_none_or(|key| key >= input_bound) {
@@ -213,7 +302,7 @@ pub fn output_merged_chunk(
             }
         }
         let mut rec = owned_from_raw_record(&raw);
-        if let Some(prev) = previous.remove(&rec.encoding) {
+        if let Some(prev) = previous.remove(&stream_key(rec.encoding, rec.offset)) {
             if rec.starts_at_chunk && prev.offset + prev.cb == rec.offset {
                 let mut merged = prev;
                 append_data(&mut merged, rec, state.temp_dir.as_deref())?;
@@ -224,7 +313,9 @@ pub fn output_merged_chunk(
         }
         if rec.ends_at_chunk {
             rec.data.spill(state.temp_dir.as_deref())?;
-            state.pending.insert(rec.encoding, rec);
+            state
+                .pending
+                .insert(stream_key(rec.encoding, rec.offset), rec);
         } else {
             state.complete(rec, min_cch)?;
         }

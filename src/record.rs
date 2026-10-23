@@ -56,6 +56,7 @@ impl RecordData {
     /// fragment reached a caller that never resolved it through
     /// `scanner::segment_raw`, which is a bug rather than a runtime
     /// condition worth returning an error for.
+    #[cfg(test)]
     pub(crate) fn text_of(&self) -> &str {
         match &self {
             RecordData::Text(s) => s,
